@@ -1,104 +1,160 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include "pins.hpp"
+
+#include "config.hpp"
+#include "stepGenLEDC.hpp"
 #include "JointsSimple.hpp"
 #include "AS5600Driver.hpp"
+#include "limits.hpp"
+#include "MotionProfile.hpp"
+#include "Controller.hpp"
 
-// -------- TwoWire buses for your encoders --------
-// TwoWire I2C_A = TwoWire(0);  // Motor A encoder bus
-// TwoWire I2C_C = TwoWire(1);  // Motor C encoder bus
+// ---------------- I2C buses --------------------------
+TwoWire I2C_SH(0);  // SHOULDER encoder bus
+TwoWire I2C_EL(1);  // ELBOW encoder bus
 
-//AS5600Driver encA(I2C_A, AS5600_ADDR, false, 0.0f);
-AS5600Driver encC(Wire, AS5600_ADDR, false, 0.0f);
+// ---------------- Motors -----------------------------
+JointSimple motorSh(enA, dirA, stepA, LEDC_CH_A);
+JointSimple motorEl(enC, dirC, stepC, LEDC_CH_C);
 
-// -------- Joints (match your pins, with LEDC) -----
-JointSimple jointA(enA, dirA, stepA, LEDC_CH_A);
-JointSimple jointB(enB, dirB, stepB, LEDC_CH_B);
-JointSimple jointC(enC, dirC, stepC, LEDC_CH_C);
+// ---------------- Encoders ---------------------------
+AS5600Driver encSh(I2C_SH, AS5600_ADDR, false, 0.0f);
+AS5600Driver encEl(I2C_EL, AS5600_ADDR, false, 0.0f);
 
-// -------- FreeRTOS tasks (encoder printouts) ------
-//TaskHandle_t TaskEncoderA;
-TaskHandle_t TaskEncoderC;
+// ---------------- Controllers ------------------------
+JointController jointSh(motorSh, encSh, SH_LIMITS, false);  // invert_dir=false
+JointController jointEl(motorEl, encEl, EL_LIMITS, true);   // invert_dir=true
 
-// void taskEncoderA(void*) {
-//   for (;;) {
-//     float rad;
-//     if (encA.readRad(rad)) {
-//       float deg = rad * 180.0f / PI;
-//       Serial.print("EncA: "); Serial.println(deg, 2);
-//     } else {
-//       Serial.println("EncA: read fail");
-//     }
-//     vTaskDelay(pdMS_TO_TICKS(50));  
-//   }
-// }
+// ---- Loop timing ----
+uint32_t last_us = 0;
 
-void taskEncoderC(void*) {
-  for (;;) {
-    float rad;
-    if (encC.readRad(rad)) {
-      float deg = rad * 180.0f / PI;
-      Serial.print("EncC: "); Serial.println(deg, 2);
-    } else {
-      Serial.println("EncC: read fail");
-    }
-    vTaskDelay(pdMS_TO_TICKS(50));
-  }
-}
+// Forward declaration so handleSerial can call it
+void printJointStates();
 
-static void handleCommand(char cmd) {
-  switch (cmd) {
-    // ----- MOTOR A (1.7A - ARM) -----
-    case '1': jointA.setSpeedFromDelayUs(600); Serial.println("Motor A speed: SLOW");   break;
-    case '2': jointA.setSpeedFromDelayUs(400); Serial.println("Motor A speed: NORMAL"); break;
-    case '3': jointA.stop();                    Serial.println("Motor A: STOP");         break;
-    case 'a': jointA.setDir(false);             Serial.println("Motor A LEFT (CCW)");    break;
-    case 'd': jointA.setDir(true);              Serial.println("Motor A RIGHT (CW)");    break;
-
-    // ----- MOTOR B (1.3A - Axis 360) -----
-    case '4': jointB.setSpeedFromDelayUs(600);  Serial.println("Motor B speed: SLOW");   break;
-    case '5': jointB.setSpeedFromDelayUs(400);  Serial.println("Motor B speed: NORMAL"); break;
-    case '6': jointB.stop();                    Serial.println("Motor B: STOP");         break;
-    case 'o': jointB.setDir(false);             Serial.println("Motor B LEFT (CCW)");    break;
-    case 'p': jointB.setDir(true);              Serial.println("Motor B RIGHT (CW)");    break;
-
-    // ----- MOTOR C (0.7A - Small) -----
-    case '7': jointC.setSpeedFromDelayUs(600);  Serial.println("Motor C speed: SLOW");   break;
-    case '8': jointC.setSpeedFromDelayUs(400);  Serial.println("Motor C speed: NORMAL"); break;
-    case '9': jointC.stop();                    Serial.println("Motor C: STOP");         break;
-    case 'n': jointC.setDir(false);             Serial.println("Motor C LEFT (CCW)");    break;
-    case 'm': jointC.setDir(true);              Serial.println("Motor C RIGHT (CW)");    break;
-  }
-}
-
+// =====================================================
 void setup() {
   Serial.begin(115200);
+  Serial.setTimeout(50);
   delay(300);
 
-  // Encoders on your two buses
-  //encA.begin(SDA_A, SCL_A, 400000);
-  Wire.begin(SDA_C, SCL_C, 400000);
-  encC.begin(SDA_C, SCL_C, 400000);
+  // I2C init for encoders
+  I2C_SH.begin(SDA_A, SCL_A, 400000);
+  I2C_EL.begin(SDA_C, SCL_C, 400000);
 
-  // Joints
-  jointA.begin();
-  jointB.begin();
-  jointC.begin();
+  // Motor + controller init
+  motorSh.begin();
+  motorEl.begin();
 
-  Serial.println("=== 3 MOTOR CONTROL (LEDC + AS5600, ESP32-S3) ===");
-  Serial.println("A: 1=Slow, 2=Normal, 3=Stop, Dir=a/d");
-  Serial.println("B: 4=Slow, 5=Normal, 6=Stop, Dir=o/p");
-  Serial.println("C: 7=Slow, 8=Normal, 9=Stop, Dir=n/m");
+  if (jointSh.teachHome()) {
+    Serial.println("Startup: SHOULDER pose set as 0 deg (home).");
+  } else {
+    Serial.println("Startup: SHOULDER home FAILED (encoder).");
+  }
 
-  // Encoder print tasks (Core 0; motors run in hardware via LEDC)
-  //xTaskCreatePinnedToCore(taskEncoderA, "EncA", 2048, nullptr, 1, &TaskEncoderA, 0);
-  xTaskCreatePinnedToCore(taskEncoderC, "EncC", 2048, nullptr, 1, &TaskEncoderC, 0);
+  if (jointEl.teachHome()) {
+    Serial.println("Startup: ELBOW pose set as 0 deg (home).");
+  } else {
+    Serial.println("Startup: ELBOW home FAILED (encoder).");
+  }
+
+  jointSh.q_target_deg = 0.0f;
+  jointEl.q_target_deg = 0.0f;
+
+  Serial.println("Joint controllers ready.");
+  Serial.println("Commands:");
+  Serial.println("  S <deg>  -> move SHOULDER smoothly to angle");
+  Serial.println("  E <deg>  -> move ELBOW smoothly to angle");
+  Serial.println("  H        -> set BOTH joints home at current pose");
+  Serial.println("  Q        -> print SH=...,EL=...");
+
+  last_us = micros();
+
+  Serial.println("READY");
 }
 
-void loop() {
-  if (Serial.available()) {
-    char c = Serial.read();
-    handleCommand(c);
+
+// =====================================================
+void handleSerial() {
+  if (!Serial.available()) return;
+
+  char cmd = Serial.read();
+
+  switch (cmd) {
+    case 'S':
+    case 's': {
+      float a = Serial.parseFloat();
+      // flush rest of line (terminator) so next cmd starts clean
+      Serial.readStringUntil('\n');
+
+      a = constrain(a, SH_LIMITS.soft_min_deg, SH_LIMITS.soft_max_deg);
+      jointSh.q_target_deg = a;
+      Serial.print("Shoulder tgt = ");
+      Serial.println(jointSh.q_target_deg);
+      break;
+    }
+
+    case 'E':
+    case 'e': {
+      float a = Serial.parseFloat();
+      Serial.readStringUntil('\n');
+
+      a = constrain(a, EL_LIMITS.soft_min_deg, EL_LIMITS.soft_max_deg);
+      jointEl.q_target_deg = a;
+      Serial.print("Elbow tgt = ");
+      Serial.println(jointEl.q_target_deg);
+      break;
+    }
+
+    case 'H':
+    case 'h': {
+      Serial.readStringUntil('\n');  // just eat rest if user typed "H\n"
+      bool okSh = jointSh.teachHome();
+      bool okEl = jointEl.teachHome();
+      Serial.print("Home set. SH=");
+      Serial.print(okSh ? "OK" : "FAIL");
+      Serial.print(" EL=");
+      Serial.println(okEl ? "OK" : "FAIL");
+      break;
+    }
+
+    case 'Q':
+    case 'q': {
+      Serial.readStringUntil('\n');  // flush newline if present
+      printJointStates();
+      break;
+    }
+
+    default:
+      Serial.readStringUntil('\n'); // flush unknown line
+      Serial.println("Unknown cmd. Use: S/E <deg>, H, Q");
+      break;
   }
-  vTaskDelay(pdMS_TO_TICKS(10));
+}
+
+// Helper to print current joint angles in a parseable format
+void printJointStates()
+{
+  float q_sh, q_el;
+  bool okSh = jointSh.readJointAngleDeg(q_sh);
+  bool okEl = jointEl.readJointAngleDeg(q_el);
+
+  Serial.print("SH=");
+  if (okSh) Serial.print(q_sh, 3); else Serial.print("NaN");
+  Serial.print(",EL=");
+  if (okEl) Serial.print(q_el, 3); else Serial.print("NaN");
+  Serial.println();
+}
+
+// =====================================================
+void loop() {
+  handleSerial();
+
+  uint32_t now = micros();
+  if (now - last_us >= (uint32_t)(CTRL_DT * 1e6f)) {
+    float dt = (now - last_us) / 1e6f;
+    last_us = now;
+
+    jointSh.update(dt);
+    jointEl.update(dt);
+  }
 }

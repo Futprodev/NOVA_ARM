@@ -1,5 +1,4 @@
 #pragma once
-
 // ---------------- Motor pins (match your test) ----------------
 constexpr int enA   = 4;
 constexpr int stepA = 5;
@@ -9,7 +8,7 @@ constexpr int enB   = 15;
 constexpr int stepB = 16;
 constexpr int dirB  = 17;
 
-constexpr int enC   = 12;
+constexpr int enC   = 9;
 constexpr int stepC = 10;
 constexpr int dirC  = 11;
 
@@ -22,9 +21,13 @@ constexpr int LEDC_CH_C = 2;
 constexpr uint8_t AS5600_ADDR = 0x36;
 
 // // Bus 0 (your "Motor A" encoder)
-// constexpr int SDA_A = 21;
-// constexpr int SCL_A = 20;   // consider using a safer pin than 20
+constexpr int SDA_A = 21;
+constexpr int SCL_A = 20;   // consider using a safer pin than 20
 
 // Bus 1 (your "Motor C" encoder)
-constexpr int SDA_C = 8;
-constexpr int SCL_C = 9;
+constexpr int SDA_C = 2;
+constexpr int SCL_C = 1;
+
+// timing
+constexpr float CTRL_HZ = 100.0f;
+constexpr float CTRL_DT = 1.0f / CTRL_HZ;
