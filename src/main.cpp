@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <math.h>
 
 #include "config.hpp"
 #include "stepGenLEDC.hpp"
@@ -8,132 +9,216 @@
 #include "limits.hpp"
 #include "MotionProfile.hpp"
 #include "Controller.hpp"
+#include "Homing.hpp"
 
-// ---------------- I2C buses --------------------------
-// Bus 0: shoulder encoder (Motor A, pins SDA_A/SCL_A)
-// Bus 1: elbow encoder   (Motor C, pins SDA_C/SCL_C)
-TwoWire I2C_SH(0);
-TwoWire I2C_EL(1);
+#include <ESP32Servo.h>
 
-// ---------------- Motors -----------------------------
-JointSimple motorSh(enA, dirA, stepA, LEDC_CH_A);  // SHOULDER on motor A pins
-JointSimple motorEl(enC, dirC, stepC, LEDC_CH_C);  // ELBOW on motor C pins
+Servo effector;
 
-// ---------------- Encoders ---------------------------
-AS5600Driver encSh(I2C_SH, AS5600_ADDR, false,  0.0f);  // shoulder encoder
-AS5600Driver encEl(I2C_EL, AS5600_ADDR, false, 0.0f);  // elbow encoder
+// ---------------- I2C bus --------------------------
+TwoWire I2C_BUS = TwoWire(0);
 
-// ---------------- Controllers ------------------------
-// last bool = invert_dir flag
-JointController jointSh(motorSh, encSh, SH_LIMITS, false);
-JointController jointEl(motorEl, encEl, EL_LIMITS, true);
+// ---------------- Motors ---------------------------
+JointSimple motorBase(enB, dirB, stepB, LEDC_CH_B);  // BASE
+JointSimple motorSh  (enA, dirA, stepA, LEDC_CH_A);  // SHOULDER
+JointSimple motorEl  (enC, dirC, stepC, LEDC_CH_C);  // ELBOW
 
-// ---- Loop timing ----
+// ---------------- Encoders (via mux) ---------------
+AS5600Driver encBase(I2C_BUS, AS5600_ADDR, I2C_MUX_ADDR, MUX_B, false, 0.0f);
+AS5600Driver encSh  (I2C_BUS, AS5600_ADDR, I2C_MUX_ADDR, MUX_A, false, 0.0f);
+AS5600Driver encEl  (I2C_BUS, AS5600_ADDR, I2C_MUX_ADDR, MUX_C, false, 0.0f);
+
+// ---------------- Controllers ----------------------
+JointController jointBase(motorBase, encBase, BASE_LIMITS, false);
+JointController jointSh  (motorSh,   encSh,   SH_LIMITS,   false);
+JointController jointEl  (motorEl,   encEl,   EL_LIMITS,   true);
+
+// ---------------- Loop timing ----------------------
 uint32_t last_us = 0;
 
-// ---- Auto loop state ----
-bool loopActive   = false;
-bool shGoingUp    = true;   // SH: 0 -> 50 -> 0 -> 50 ...
-bool elGoingUp    = true;   // EL: 120 -> -120 -> 120 ...
+bool  loopActive  = false;
+bool  shGoingUp   = false;
+bool  elGoingUp   = false;
+bool  baseGoingUp = false;
 
-// desired segment limits
-const float SH_MIN_LOOP = -20.0f;
-const float SH_MAX_LOOP = 20.0f;
+// Smaller loop ranges (inside hard limits)
+const float SH_MIN_LOOP   = 58.0f;
+const float SH_MAX_LOOP   = 85.0f;
 
-const float EL_MIN_LOOP = -120.0f;
-const float EL_MAX_LOOP =  120.0f;
+const float EL_MIN_LOOP   = -95.0f;
+const float EL_MAX_LOOP   = -90.0f;
 
-// threshold for "we reached the end" (deg)
+const float BASE_MIN_LOOP = -90.0f;
+const float BASE_MAX_LOOP =  90.0f;
+
+// Threshold for “we reached an endpoint”
 const float LOOP_EPS = 2.0f;
 
-// =====================================================
+// ---------------- Homing state ---------------------
+HomingState homing;
 
+// ---------------- Move sequence --------------------
+enum MoveStage {
+  MOVE_IDLE = 0,
+  MOVE_SH_EL_TO_ZERO,
+  MOVE_BASE_TO_TARGET,
+  MOVE_SH_EL_TO_TARGET
+};
+
+struct MoveSequence {
+  MoveStage stage = MOVE_IDLE;
+  float target_base = 0.0f;
+  float target_sh   = 0.0f;
+  float target_el   = 0.0f;
+  float hold_base   = 0.0f;  // base hold while SH/EL -> 0
+};
+
+MoveSequence moveSeq;
+
+const float MOVE_TOL_DEG   = 0.5f;
+const float REQ_DIFF_EPS   = 0.25f;
+
+static inline bool diffGT(float a, float b, float eps) {
+  return fabsf(a - b) > eps;
+}
+
+// Universal sequenced request
+void requestTarget(float base_deg, float sh_deg, float el_deg, bool force=false)
+{
+  // clamp to soft limits
+  float cb = constrain(base_deg, BASE_LIMITS.soft_min_deg, BASE_LIMITS.soft_max_deg);
+  float cs = constrain(sh_deg,   SH_LIMITS.soft_min_deg,   SH_LIMITS.soft_max_deg);
+  float ce = constrain(el_deg,   EL_LIMITS.soft_min_deg,   EL_LIMITS.soft_max_deg);
+
+  // ignore trivial repeats unless forced
+  if (!force) {
+    if (!diffGT(cb, moveSeq.target_base, REQ_DIFF_EPS) &&
+        !diffGT(cs, moveSeq.target_sh,   REQ_DIFF_EPS) &&
+        !diffGT(ce, moveSeq.target_el,   REQ_DIFF_EPS)) {
+      return;
+    }
+  }
+
+  moveSeq.target_base = cb;
+  moveSeq.target_sh   = cs;
+  moveSeq.target_el   = ce;
+
+  // latch base hold reference
+  if (jointBase.last_q_valid) moveSeq.hold_base = jointBase.last_q_deg;
+  else                        moveSeq.hold_base = jointBase.q_target_deg;
+
+  moveSeq.stage = MOVE_SH_EL_TO_ZERO;
+
+  Serial.print("[SEQ] Request: BASE=");
+  Serial.print(moveSeq.target_base, 1);
+  Serial.print(" SH=");
+  Serial.print(moveSeq.target_sh, 1);
+  Serial.print(" EL=");
+  Serial.println(moveSeq.target_el, 1);
+}
+
+// ---------------- Loop goals -----------------------
+float loopGoalBase = 0.0f;
+float loopGoalSh   = 0.0f;
+float loopGoalEl   = 0.0f;
+
+// ---------------- Post-home edge detect ------------
+static bool prev_all_homed = false;
+
+// ---------------- SETUP ----------------------------
 void setup() {
   Serial.begin(115200);
   Serial.setTimeout(50);
   delay(300);
 
-  // I2C init for encoders
-  I2C_SH.begin(SDA_A, SCL_A, 400000);  // shoulder encoder (Motor A)
-  I2C_EL.begin(SDA_C, SCL_C, 400000);  // elbow encoder   (Motor C)
+  // I2C
+  I2C_BUS.begin(SDA_A, SCL_A, 100000);
 
-  // Motor + controller init
+  // Limit switches
+  pinMode(LIM_A, INPUT_PULLUP);
+  pinMode(LIM_B, INPUT_PULLUP);
+  pinMode(LIM_C, INPUT_PULLUP);
+
+  pinMode(servoPin, OUTPUT);
+  effector.attach(servoPin);
+
+  jointBase.gear_ratio = BASE_GEAR_RATIO;
+  jointSh.gear_ratio   = 16.0f;
+  jointEl.gear_ratio   = 16.0f;
+
+  // Motors
+  motorBase.begin();
   motorSh.begin();
   motorEl.begin();
 
-  // --- AUTO-HOME BOTH JOINTS ON STARTUP ---
-  if (jointSh.teachHome()) {
-    Serial.println("Startup: SHOULDER pose set as 0 deg (home).");
-  } else {
-    Serial.println("Startup: SHOULDER home FAILED (encoder).");
-  }
+  initHomingState(homing, jointBase, jointSh, jointEl);
 
-  if (jointEl.teachHome()) {
-    Serial.println("Startup: ELBOW pose set as 0 deg (home).");
-  } else {
-    Serial.println("Startup: ELBOW home FAILED (encoder).");
-  }
-
-  jointSh.q_target_deg = 0.0f;
-  jointEl.q_target_deg = 0.0f;
-
-  Serial.println("Joint controllers ready.");
-  Serial.println("Commands:");
-  Serial.println("  s  -> start SH(0↔50) + EL(120↔-120) loop");
-  Serial.println("  h  -> stop loop and go to (0,0)");
+  Serial.println("Startup: automatic homing towards limit switches...");
 
   last_us = micros();
 }
 
-// =====================================================
-
+// ---------------- SERIAL ---------------------------
 void handleSerial() {
   if (!Serial.available()) return;
 
   char cmd = Serial.read();
 
   switch (cmd) {
-    // ---- START LOOP ----
     case 's':
     case 'S': {
-      loopActive = true;
+      loopActive  = true;
+      shGoingUp   = true;
+      elGoingUp   = true;
+      baseGoingUp = true;
 
-      // start from one end: SH up towards 50, EL up towards 120
-      shGoingUp = true;
-      elGoingUp = true;
+      loopGoalSh   = SH_MAX_LOOP;
+      loopGoalEl   = EL_MAX_LOOP;
+      loopGoalBase = BASE_MAX_LOOP;
 
-      jointSh.q_target_deg = SH_MAX_LOOP;
-      jointEl.q_target_deg = EL_MAX_LOOP;
+      requestTarget(loopGoalBase, loopGoalSh, loopGoalEl, true);
 
-      Serial.println("Loop START: SH 0↔50, EL 120↔-120.");
-      // flush rest of line
+      Serial.println("[LOOP] Started (sequenced).");
       Serial.readStringUntil('\n');
       break;
     }
 
-    // ---- STOP LOOP + GO TO (0,0) ----
     case 'h':
     case 'H': {
       loopActive = false;
 
-      jointSh.q_target_deg = 0.0f;
-      jointEl.q_target_deg = 0.0f;
+      // force a sequence to (0,0,0)
+      requestTarget(0.0f, 0.0f, 0.0f, true);
 
-      Serial.println("Loop STOP: targets -> SH=0, EL=0");
+      Serial.println("[CMD] Request -> (0,0,0) (sequenced).");
+      Serial.readStringUntil('\n');
+      break;
+    }
+
+    case 'p':
+    case 'P': {
+      if (jointBase.last_q_valid && jointSh.last_q_valid && jointEl.last_q_valid) {
+        Serial.print("BASE=");
+        Serial.print(jointBase.last_q_deg, 2);
+        Serial.print("  SH=");
+        Serial.print(jointSh.last_q_deg, 2);
+        Serial.print("  EL=");
+        Serial.println(jointEl.last_q_deg, 2);
+      } else {
+        Serial.println("Joint angles not valid yet (no successful reads).");
+      }
       Serial.readStringUntil('\n');
       break;
     }
 
     default:
-      // flush the rest of the line so nothing weird is left
       Serial.readStringUntil('\n');
-      Serial.println("Unknown cmd. Use: s (start loop), h (stop + home 0,0).");
+      Serial.println("Unknown cmd. Use 's' (loop), 'h' (home), 'p' (print).");
       break;
   }
 }
 
-// =====================================================
-
+// ---------------- MAIN LOOP ------------------------
 void loop() {
   handleSerial();
 
@@ -142,68 +227,179 @@ void loop() {
     float dt = (now - last_us) / 1e6f;
     last_us = now;
 
-    // --- If loop active, manage end-point flipping ---
-    if (loopActive) {
-      float q_sh, q_el;
-      if (jointSh.readJointAngleDeg(q_sh) && jointEl.readJointAngleDeg(q_el)) {
+    if (!homing.all_homed) {
+      // Open-loop homing phase
+      updateHoming(homing, dt,
+                   jointBase, jointSh, jointEl,
+                   motorBase, motorSh, motorEl);
 
-        // SHOULDER: 0 <-> 50
+      prev_all_homed = false; // reset edge detect
+    } else {
+
+      // --------- FIRST tick after homing: HOLD pose ---------
+      if (!prev_all_homed) {
+        prev_all_homed = true;
+
+        // Hold current pose (prevents any default 0 target jump)
+        if (jointBase.last_q_valid) jointBase.q_target_deg = 0;
+        if (jointSh.last_q_valid)   jointSh.q_target_deg   = jointSh.last_q_deg + 2;
+        if (jointEl.last_q_valid)   jointEl.q_target_deg   = jointEl.last_q_deg + 2;
+
+        Serial.println("[POSTHOME] Holding pose (no auto move).");
+      }
+
+      // ---------- sequence logic ----------
+      if (moveSeq.stage != MOVE_IDLE) {
+
+        // Always apply targets for each stage
+        switch (moveSeq.stage) {
+
+          case MOVE_SH_EL_TO_ZERO:
+            jointSh.q_target_deg   = 0.0f;
+            jointEl.q_target_deg   = 0.0f;
+            jointBase.q_target_deg = moveSeq.hold_base;
+            break;
+
+          case MOVE_BASE_TO_TARGET:
+            jointBase.q_target_deg = moveSeq.target_base;
+            jointSh.q_target_deg   = 0.0f;
+            jointEl.q_target_deg   = 0.0f;
+            break;
+
+          case MOVE_SH_EL_TO_TARGET:
+            jointBase.q_target_deg = moveSeq.target_base;
+            jointSh.q_target_deg   = moveSeq.target_sh;
+            jointEl.q_target_deg   = moveSeq.target_el;
+            break;
+
+          default:
+            break;
+        }
+
+        // Advance stages only when we have valid angles
+        if (jointBase.last_q_valid && jointSh.last_q_valid && jointEl.last_q_valid) {
+          float q_ba = jointBase.last_q_deg;
+          float q_sh = jointSh.last_q_deg;
+          float q_el = jointEl.last_q_deg;
+
+          if (moveSeq.stage == MOVE_SH_EL_TO_ZERO) {
+            if (fabsf(q_sh) < MOVE_TOL_DEG && fabsf(q_el) < MOVE_TOL_DEG) {
+              moveSeq.stage = MOVE_BASE_TO_TARGET;
+              Serial.println("[SEQ] SH/EL at 0 -> moving BASE");
+            }
+          }
+          else if (moveSeq.stage == MOVE_BASE_TO_TARGET) {
+            if (fabsf(q_ba - moveSeq.target_base) < MOVE_TOL_DEG) {
+              moveSeq.stage = MOVE_SH_EL_TO_TARGET;
+              Serial.println("[SEQ] BASE at target -> moving SH/EL");
+            }
+          }
+          else if (moveSeq.stage == MOVE_SH_EL_TO_TARGET) {
+            if (fabsf(q_sh - moveSeq.target_sh) < MOVE_TOL_DEG &&
+                fabsf(q_el - moveSeq.target_el) < MOVE_TOL_DEG) {
+              moveSeq.stage = MOVE_IDLE;
+              delay(100);
+              effector.write(0);
+              delay(1000);
+              effector.write(145);
+              Serial.println("[SEQ] Complete");
+            }
+          }
+        }
+      }
+
+      // ---------- update controllers -----------
+      jointBase.update(dt);
+      jointSh.update(dt);
+      jointEl.update(dt);
+
+      // ---------- loop active: check for endpoint and reverse --------
+      if (loopActive &&
+          moveSeq.stage == MOVE_IDLE &&
+          jointBase.last_q_valid &&
+          jointSh.last_q_valid &&
+          jointEl.last_q_valid) {
+
+        float q_ba = jointBase.last_q_deg;
+        float q_sh = jointSh.last_q_deg;
+        float q_el = jointEl.last_q_deg;
+
+        bool changed = false;
+
         if (shGoingUp) {
-          // going towards 50
           if (q_sh > (SH_MAX_LOOP - LOOP_EPS)) {
             shGoingUp = false;
-            jointSh.q_target_deg = SH_MIN_LOOP;   // go back down to 0
+            loopGoalSh = SH_MIN_LOOP;
+            changed = true;
           }
         } else {
-          // going towards 0
           if (q_sh < (SH_MIN_LOOP + LOOP_EPS)) {
             shGoingUp = true;
-            jointSh.q_target_deg = SH_MAX_LOOP;   // go up to 50
+            loopGoalSh = SH_MAX_LOOP;
+            changed = true;
           }
         }
 
-        // ELBOW: 120 <-> -120
         if (elGoingUp) {
-          // going towards +120
           if (q_el > (EL_MAX_LOOP - LOOP_EPS)) {
             elGoingUp = false;
-            jointEl.q_target_deg = EL_MIN_LOOP;   // go down to -120
+            loopGoalEl = EL_MIN_LOOP;
+            changed = true;
           }
         } else {
-          // going towards -120
           if (q_el < (EL_MIN_LOOP + LOOP_EPS)) {
             elGoingUp = true;
-            jointEl.q_target_deg = EL_MAX_LOOP;   // go up to 120
+            loopGoalEl = EL_MAX_LOOP;
+            changed = true;
           }
+        }
+
+        if (baseGoingUp) {
+          if (q_ba > (BASE_MAX_LOOP - LOOP_EPS)) {
+            baseGoingUp = false;
+            loopGoalBase = BASE_MIN_LOOP;
+            changed = true;
+          }
+        } else {
+          if (q_ba < (BASE_MIN_LOOP + LOOP_EPS)) {
+            baseGoingUp = true;
+            loopGoalBase = BASE_MAX_LOOP;
+            changed = true;
+          }
+        }
+
+        if (changed) {
+          requestTarget(loopGoalBase, loopGoalSh, loopGoalEl, true);
         }
       }
     }
 
-    // --- Update both joints (control + S-curve + LEDC) ---
-    jointSh.update(dt);
-    jointEl.update(dt);
-
-    // Optional debug
+    // ---- periodic debug ----
     static uint32_t last_print = 0;
     if (millis() - last_print > 200) {
-      float q_sh, q_el;
+      Serial.print("BA q=");
+      Serial.print(jointBase.last_q_valid ? jointBase.last_q_deg : NAN, 1);
+      Serial.print(" tgt=");
+      Serial.print(jointBase.q_target_deg, 1);
+      Serial.print(" | ");
 
-      if (jointSh.readJointAngleDeg(q_sh)) {
-        Serial.print("SH q=");
-        Serial.print(q_sh, 1);
-        Serial.print(" tgt=");
-        Serial.print(jointSh.q_target_deg, 1);
-        Serial.print(" | ");
-      }
+      Serial.print("SH q=");
+      Serial.print(jointSh.last_q_valid ? jointSh.last_q_deg : NAN, 1);
+      Serial.print(" tgt=");
+      Serial.print(jointSh.q_target_deg, 1);
+      Serial.print(" | ");
 
-      if (jointEl.readJointAngleDeg(q_el)) {
-        Serial.print("EL q=");
-        Serial.print(q_el, 1);
-        Serial.print(" tgt=");
-        Serial.print(jointEl.q_target_deg, 1);
-      }
+      Serial.print("EL q=");
+      Serial.print(jointEl.last_q_valid ? jointEl.last_q_deg : NAN, 1);
+      Serial.print(" tgt=");
+      Serial.print(jointEl.q_target_deg, 1);
 
       if (loopActive) Serial.print("  [LOOP]");
+      if (moveSeq.stage != MOVE_IDLE) {
+        Serial.print("  [SEQ STAGE=");
+        Serial.print((int)moveSeq.stage);
+        Serial.print("]");
+      }
       Serial.println();
 
       last_print = millis();
