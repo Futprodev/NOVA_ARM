@@ -20,55 +20,55 @@ struct JointLimits {
   float kp, ki, kd;
 };
 
+// Limit Switch Base: 152, Shoulder: -94, Elbow: -142
 // ===================== ELBOW (light, fastest) =====================
 inline const JointLimits EL_LIMITS {
+  .soft_min_deg      = -141.0f,
+  .soft_max_deg      =  156.7f,
+  .hard_min_deg      = -143.0f,
+  .hard_max_deg      =  157.0f,
+
+  .max_deg_per_s     = 20.0f,   // was 5
+  .max_deg_per_s2    = 200.0f,  // was 50
+  .max_deg_per_s3    = 800.0f,  // was 200
+
+  .max_freq_fast_hz  = 2800.0f, // was 850
+  .max_freq_slow_hz  = 1400.0f,  // was 400
+
+  .kp = 0.3f, .ki = 0.0f, .kd = 0.1f
+};
+
+// ===================== SHOULDER (medium) =====================
+inline const JointLimits SH_LIMITS {
+  .soft_min_deg      = -94.0f,
+  .soft_max_deg      =  104.7f,
+  .hard_min_deg      = -94.0f,
+  .hard_max_deg      =  105.0f,
+
+  .max_deg_per_s     = 20.0f,   // was 5
+  .max_deg_per_s2    = 150.0f,  // was 50
+  .max_deg_per_s3    = 600.0f,  // was 200
+
+  .max_freq_fast_hz  = 2800.0f, // was 850
+  .max_freq_slow_hz  = 1400.0f,  // was 400
+
+  .kp = 0.3f, .ki = 0.0f, .kd = 0.11f
+};
+
+// ===================== BASE (heaviest, slowest) =====================
+inline const JointLimits BASE_LIMITS {
   .soft_min_deg      = -150.0f,
   .soft_max_deg      =  150.0f,
   .hard_min_deg      = -152.0f,
   .hard_max_deg      =  152.0f,
 
-  .max_deg_per_s     = 200.0f,
-  .max_deg_per_s2    = 1500.0f,
-  .max_deg_per_s3    = 6000.0f,
+  // --- SPEED LIMITS ---
+  .max_deg_per_s     = 20.0f,     
+  .max_deg_per_s2    = 100.0f,   
+  .max_deg_per_s3    = 300.0f,   
 
-  .max_freq_fast_hz  = 6250.0f,   //8250
-  .max_freq_slow_hz  = 2250.0f,   //2250
+  .max_freq_fast_hz  = 1400.0f,  
+  .max_freq_slow_hz  = 711.0f,   
 
-  .kp = 0.0025f, .ki = 0.0f, .kd = 0.0039f
-  // 0.017, 0.0, 0.018
-};
-
-// ===================== SHOULDER (medium) =====================
-inline const JointLimits SH_LIMITS {
-  .soft_min_deg      = -90.0f,
-  .soft_max_deg      =  90.0f,
-  .hard_min_deg      = -105.0f,
-  .hard_max_deg      =  105.0f,
-
-  .max_deg_per_s     = 14.0f, //140
-  .max_deg_per_s2    = 50.0f, //1000
-  .max_deg_per_s3    = 200.0f, //4000
-
-  .max_freq_fast_hz  = 5250.0f, //5250
-  .max_freq_slow_hz  = 2250.0f, //1250
-
-  .kp = 0.0022f, .ki = 0.0f, .kd = 0.0037f
-  // 0.01, 0.0, 0.012
-};
-
-// ===================== BASE (heaviest, slowest) =====================
-inline const JointLimits BASE_LIMITS {
-  .soft_min_deg      = -90.0f,
-  .soft_max_deg      =  90.0f,
-  .hard_min_deg      = -95.0f,
-  .hard_max_deg      =  95.0f,
-
-  .max_deg_per_s     = 90.0f,
-  .max_deg_per_s2    = 800.0f,
-  .max_deg_per_s3    = 3000.0f,
-
-  .max_freq_fast_hz  = 5000.0f,
-  .max_freq_slow_hz  = 2000.0f,
-
-  .kp = 0.3f, .ki = 0.0f, .kd = 0.002f
+  .kp = 0.06f, .ki = 0.0f, .kd = 0.0f
 };
