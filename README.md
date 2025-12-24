@@ -93,17 +93,17 @@ On NOVA Workspace
 ```bash
 source /opt/ros/jazzy/setup.bash
 
-### launch rviz
+# launch rviz
 ros2 launch nova_arm check_urdf.launch.py
 
-### checking node and topic
+# checking node and topic
 ros2 node list
 ros2 topic list
 
-### check publish
+# check publish
 ros2 topic echo /joint_states
 
-### publish a command
+# publish a command
 ros2 topic pub /nova_arm/command_deg std_msgs/msg/Float64MultiArray \
   "{layout: {dim: [], data_offset: 0}, data: [0.0, 45.0, -30.0]}"
 ```
