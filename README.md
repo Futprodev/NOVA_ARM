@@ -17,7 +17,7 @@ This repository contains firmware and ROS 2 nodes for the NOVA 3-DOF robotic arm
   - `LIM_B` – Base  
   - `LIM_C` – Elbow
 - **Gear ratios**
-  - Base: `BASE_GEAR_RATIO` (from `config.hpp`)
+  - Base: `4:1` 
   - Shoulder: `16:1`
   - Elbow: `16:1`
 
