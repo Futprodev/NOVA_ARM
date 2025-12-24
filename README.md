@@ -71,6 +71,21 @@ Gripper:
 
 ---
 
+## 4. micro-ROS Agent (PC / WSL)
+
+On Linux / WSL:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/microros_ws/install/setup.bash
+
+# check USB device
+ls /dev/ttyACM*
+
+# start agent
+ros2 run micro_ros_agent micro_ros_agent serial --dev /dev/ttyACM0 -b 115200
+```
+
 ## 5. Movement Testing
 
 On NOVA Workspace
@@ -91,6 +106,6 @@ ros2 topic echo /joint_states
 ### publish a command
 ros2 topic pub /nova_arm/command_deg std_msgs/msg/Float64MultiArray \
   "{layout: {dim: [], data_offset: 0}, data: [0.0, 45.0, -30.0]}"
-
+```
 
 
